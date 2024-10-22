@@ -23,9 +23,16 @@ class MacsimaKeys(ModeEnum):
     """Keys for *MACSima* formatted dataset."""
 
     # images
-    METADATA_SUFFIX = ".QiPattern.txt"
-    IMAGE_OMETIF = ".ome.tif"
-    IMAGE_QPTIF = ".qptif"
+    IMAGE_OMETIF = ".tif"
+    CHANNEL_NAMES = "channel_names"
+    CYCLE = "Cycle"
+    SCANTYPE = "ScanType"
+    ROI_ID = "RoiId"
+    ROI_ID_deprecated = "ROI ID"
+    SCREENS = "screens"
+    REAGENTS = "reagents"
+
+
 
 
 class CurioKeys(ModeEnum):

@@ -1,22 +1,22 @@
 from __future__ import annotations
 
+import glob
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
 import dask.array as da
-import pandas as pd
 import spatialdata as sd
-from aicsimageio import AICSImage
-from dask_image.imread import imread
-from ome_types import from_tiff
+from bioio import BioImage
+from ome_types.model import Pixels, UnitsLength
 from spatialdata import SpatialData
 from spatialdata._logging import logger
+from spatialdata.transformations import Identity
 
 from spatialdata_io._constants._constants import MacsimaKeys
 from spatialdata_io._docs import inject_docs
-from spatialdata_io.readers._utils._utils import calc_scale_factors, parse_physical_size
 
 __all__ = ["macsima"]
 
@@ -24,22 +24,15 @@ __all__ = ["macsima"]
 @inject_docs(vx=MacsimaKeys)
 def macsima(
     path: str | Path,
-    metadata: bool = True,
+    c_subset: list[str] = None,
+    transformations: bool = False,
     imread_kwargs: Mapping[str, Any] = MappingProxyType({}),
-    subset: int | None = None,
-    c_subset: int | None = None,
-    max_chunk_size: int = 1024,
-    c_chunks_size: int = 1,
-    multiscale: bool = True,
-    transformations: bool = True,
-    scale_factors: list[int] | None = None,
-    default_scale_factor: int = 2,
+    image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
 ) -> SpatialData:
     """
     Read *MACSima* formatted dataset.
 
-    This function reads images from a MACSima cyclic imaging experiment. Metadata of the cycles is either parsed from a metadata file or image names.
-    For parsing .qptiff files, installation of bioformats is adviced.
+    This function reads images from a MACSima cyclic imaging experiment.
 
     .. seealso::
 
@@ -49,146 +42,127 @@ def macsima(
     ----------
     path
         Path to the directory containing the data.
-    metadata
-        Whether to search for a .txt file with metadata in the folder. If False, the metadata in the image names is used.
-    imread_kwargs
-        Keyword arguments passed to :func:`dask_image.imread.imread`.
-    subset
-        Subset the image to the first ``subset`` pixels in x and y dimensions.
     c_subset
-        Subset the image to the first ``c_subset`` channels.
-    max_chunk_size
-        Maximum chunk size for x and y dimensions.
-    c_chunks_size
-        Chunk size for c dimension.
-    multiscale
-        Whether to create a multiscale image.
+        Channel names to consider.
     transformations
         Whether to add a transformation from pixels to microns to the image.
-    scale_factors
-        Scale factors to use for downsampling. If None, scale factors are calculated based on image size.
-    default_scale_factor
-        Default scale factor to use for downsampling.
+    imread_kwargs
+        Keyword arguments passed to :func:`bioio.BioImage`.
+    image_model_kwargs
+        Keyword arguments to pass to the image models.
 
     Returns
     -------
     :class:`spatialdata.SpatialData`
     """
-    path = Path(path)
-    path_files = []
-    pixels_to_microns = None
-    if metadata:
-        # read metadata to get list of images and channel names
-        path_files = list(path.glob(f"*{MacsimaKeys.METADATA_SUFFIX}"))
-        if len(path_files) > 0:
-            if len(path_files) > 1:
-                logger.warning(
-                    f"Cannot determine metadata file. Expecting a single file with format .txt. Got multiple files: {path_files}"
-                )
-            path_metadata = list(path.glob(f"*{MacsimaKeys.METADATA_SUFFIX}"))[0]
-            df = pd.read_csv(path_metadata, sep="\t", header=0, index_col=None)
-            logger.debug(df)
-            df["channel"] = df["ch1"].str.split(" ").str[0]
-            df["round_channel"] = df["Round"] + " " + df["channel"]
-            path_files = [path / p for p in df.filename.values]
-            assert all(
-                [p.exists() for p in path_files]
-            ), f"Cannot find all images in metadata file. Missing: {[p for p in path_files if not p.exists()]}"
-            round_channels = df.round_channel.values
-            stack, sorted_channels = get_stack(path_files, round_channels, imread_kwargs)
-        else:
-            logger.warning("Cannot find metadata file. Will try to parse from image names.")
-    if not metadata or len(path_files) == 0:
-        # get list of image paths, get channel name from OME data and cycle number from filename
-        # look for OME-TIFF files
-        ome_patt = f"*{MacsimaKeys.IMAGE_OMETIF}*"
-        path_files = list(path.glob(ome_patt))
-        if not path_files:
-            # look for .qptiff files
-            qptif_patt = f"*{MacsimaKeys.IMAGE_QPTIF}*"
-            path_files = list(path.glob(qptif_patt))
-            logger.debug(path_files)
-            if not path_files:
-                raise ValueError("Cannot determine data set. Expecting '{ome_patt}' or '{qptif_patt}' files")
-            # TODO: warning if not 1 ROI with 1 .qptiff per cycle
-            # TODO: robuster parsing of {name}_cycle{round}_{scan}.qptiff
-            rounds = [f"R{int(p.stem.split('_')[1][5:])}" for p in path_files]
-            # parse .qptiff files
-            imgs = [AICSImage(img, **imread_kwargs) for img in path_files]
-            # sort based on cycle number
-            rounds, imgs = zip(*sorted(zip(rounds, imgs), key=lambda x: int(x[0][1:])))
-            channels_per_round = [img.channel_names for img in imgs]
-            # take first image and first channel to get physical size
-            ome_data = imgs[0].ome_metadata
-            logger.debug(ome_data)
-            pixels_to_microns = parse_physical_size(ome_pixels=ome_data.images[0].pixels)
-            da_per_round = [img.dask_data[0, :, 0, :, :] for img in imgs]
-            sorted_channels = []
-            for r, cs in zip(rounds, channels_per_round):
-                for c in cs:
-                    sorted_channels.append(f"{r} {c}")
-            stack = da.stack(da_per_round).squeeze()
-            # Parse OME XML
-            # img.ome_metadata
-            # arr = img.dask_data[0, :, 0, :, :]
-            # channel_names = img.channel_names
-            logger.debug(sorted_channels)
-            logger.debug(stack)
-        else:
-            logger.debug(path_files[0])
-            # make sure not to remove round 0 when parsing!
-            rounds = [f"R{int(p.stem.split('_')[0])}" for p in path_files]
-            channels = [from_tiff(p).images[0].pixels.channels[0].name for p in path_files]
-            round_channels = [f"{r} {c}" for r, c in zip(rounds, channels)]
-            stack, sorted_channels = get_stack(path_files, round_channels, imread_kwargs)
+    path_list=glob.glob( f"{path}/*{MacsimaKeys.IMAGE_OMETIF}" )
+    if not path_list:
+        raise ValueError( f"Cannot determine data set, expecting '*{MacsimaKeys.IMAGE_OMETIF}' files in {path}." )
+    imgs=[BioImage(img_path, **imread_kwargs) for img_path in path_list]
 
-    # do subsetting if needed
-    if subset:
-        stack = stack[:, :subset, :subset]
+    image_name = imgs[0].ome_metadata.experiments[0].description
+
+    metadata =[_get_metadata( _img ) for _img in imgs]
+    c_coords = [ item[2] for item in metadata ]
+    roi = [ item[3] for item in metadata ]
+    if roi[0] is not None:
+        assert all( x == roi[0] for x in roi ), f"Extracted ROI ID not equal for all '{MacsimaKeys.IMAGE_OMETIF}' files found in '{path}'."
+        roi_id = roi[0]
+        to_coordinate_system = f"global_{roi_id}"
+        image_name = f"{image_name}_{roi_id}"
+    else:
+        to_coordinate_system = "global"
+
+    names = [  "_".join([part for part in name_parts if part]) for name_parts in metadata  ] 
+    number_pattern = re.compile(r'^\d+')
+    # sort by cycle number
+    combined_sorted = sorted(list(zip(names, c_coords, imgs)), key=lambda x: int(number_pattern.match(x[0]).group()))
+    names, c_coords, imgs = zip(*combined_sorted)
+
     if c_subset:
-        stack = stack[:c_subset, :, :]
-        sorted_channels = sorted_channels[:c_subset]
-    if multiscale and not scale_factors:
-        scale_factors = calc_scale_factors(stack, default_scale_factor=default_scale_factor)
-    if not multiscale:
-        scale_factors = None
-    logger.debug(f"Scale factors: {scale_factors}")
+        names, c_coords, imgs = map( list, zip(*[
+            (elem1, elem2, elem3) for elem1, elem2, elem3 in zip(names, c_coords, imgs)
+            if elem2 in c_subset
+        ]) )
+    
+    if not c_coords:
+        raise ValueError( f"List of channels to consider is empty after subsetting by {c_subset}" )
 
-    t_dict = None
-    if transformations:
-        pixels_to_microns = pixels_to_microns or parse_physical_size(path_files[0])
-        t_pixels_to_microns = sd.transformations.Scale([pixels_to_microns, pixels_to_microns], axes=("x", "y"))
-        # 'microns' is also used in merscope example
-        # no inverse needed as the transformation is already from pixels to microns
-        t_dict = {"global": t_pixels_to_microns}
-    # # chunk_size can be 1 for channels
-    chunks = {
-        "x": max_chunk_size,
-        "y": max_chunk_size,
-        "c": c_chunks_size,
-    }
-    stack = sd.models.Image2DModel.parse(
-        stack,
-        # TODO: make sure y and x locations are correct
+    # get physical units:
+    pixels_to_microns=_parse_physical_size( pixels=imgs[0].ome_metadata.images[0].pixels )
+    # sanity check (physical size of all images should be the same for one ROI)
+    for _img in imgs:
+        assert pixels_to_microns == _parse_physical_size( _img.ome_metadata.images[0].pixels )
+    assert imgs[0].dims.order == "TCZYX"
+    array=[_img.get_image_dask_data().squeeze( ) for _img in imgs]
+    array=da.stack( array, axis=0 )
+
+    t_pixels_to_microns = sd.transformations.Scale([pixels_to_microns, pixels_to_microns], axes=("x", "y")) if transformations else Identity()
+
+    se = sd.models.Image2DModel.parse(
+        array,
         dims=["c", "y", "x"],
-        scale_factors=scale_factors,
-        chunks=chunks,
-        c_coords=sorted_channels,
-        transformations=t_dict,
+        c_coords=names,
+        transformations={ to_coordinate_system: t_pixels_to_microns, },
+        **image_models_kwargs,
     )
-    sdata = sd.SpatialData(images={path.stem: stack}, table=None)
+
+    sdata = sd.SpatialData(images={image_name: se}, table=None)
 
     return sdata
 
 
-def get_stack(path_files: list[Path], round_channels: list[str], imread_kwargs: Mapping[str, Any]) -> Any:
-    imgs_channels = list(zip(path_files, round_channels))
-    logger.debug(imgs_channels)
-    # sort based on round number
-    imgs_channels = sorted(imgs_channels, key=lambda x: int(x[1].split(" ")[0][1:]))
-    logger.debug(f"Len imgs_channels: {len(imgs_channels)}")
-    # read in images and merge channels
-    sorted_paths, sorted_channels = list(zip(*imgs_channels))
-    imgs = [imread(img, **imread_kwargs) for img in sorted_paths]
-    stack = da.stack(imgs).squeeze()
-    return stack, sorted_channels
+def _get_structured_annotations( img: BioImage, metadata_key:str  )->str | None:
+    structured_annotations = img.ome_metadata.structured_annotations
+    value=[item.value[ metadata_key ]  for item in structured_annotations if item.value[ metadata_key ] is not None ]
+    if not value:
+        return None
+    assert all( x == value[0] for x in value ), f"Structured annotations for key '{metadata_key}' are not equal (found '{value}') for object of type '{type(img).__name__}': {img}."
+    return value[0]
+
+
+def _get_metadata( img: BioImage )->list[str|None]:
+    cycle=_get_structured_annotations( img, metadata_key=MacsimaKeys.CYCLE )
+    # check that cycle is not None
+    assert cycle is not None, f"'{MacsimaKeys.CYCLE}' could not be found in metadata for object of type '{type(img).__name__}': {img}"
+    # we allow scantype to be None (i.e. not found in structured annotations of ome metadata)
+    scantype=_get_structured_annotations( img, metadata_key=MacsimaKeys.SCANTYPE )
+    channel_name = getattr(img, MacsimaKeys.CHANNEL_NAMES, None)
+    if channel_name is None:
+        raise AttributeError(f"Attribute '{MacsimaKeys.CHANNEL_NAMES}' not found for object of type '{type(img).__name__}': {img}")
+    assert len( channel_name ) ==1, f"There should be exactly one channel specified in metadata, but found '{channel_name}'."
+    channel_name =channel_name[0]
+    if not channel_name:
+        raise ValueError( f"'{MacsimaKeys.CHANNEL_NAMES}' is not specified in metadata for object of type '{type(img).__name__}': {img}" )
+    # get the reagents used from ome metadata if they can be found in ome metadata
+    reagents=None
+    if hasattr( img.ome_metadata, MacsimaKeys.SCREENS ):
+        screens=getattr( img.ome_metadata, MacsimaKeys.SCREENS )
+        assert len( screens ) == 1, f"There should be exactly one '{MacsimaKeys.SCREENS}' specified in ome metadata, but found '{screens}' for object of type '{type(img).__name__}': {img}."
+        screens = screens[0]
+        reagents=getattr( screens, MacsimaKeys.REAGENTS, None )
+        if reagents:
+            assert len( reagents ) == 1, f"There should be exactly one '{MacsimaKeys.REAGENTS}' specified in ome metadata, but found '{reagents}' for object of type '{type(img).__name__}': {img}."
+            reagents = reagents[0].name
+    roi_id=_get_structured_annotations( img, metadata_key=MacsimaKeys.ROI_ID ) or _get_structured_annotations( img, metadata_key=MacsimaKeys.ROI_ID_deprecated )
+    return [ cycle, scantype, channel_name, roi_id, reagents ]
+
+
+def _parse_physical_size(pixels: Pixels | None = None) -> float:
+    """Parse physical size from OME-TIFF to micrometer."""
+    logger.debug(pixels)
+    if pixels.physical_size_x_unit != pixels.physical_size_y_unit:
+        logger.error("Physical units for x and y dimensions are not the same.")
+        raise NotImplementedError
+    if pixels.physical_size_x != pixels.physical_size_y:
+        logger.error("Physical sizes for x and y dimensions are the same.")
+        raise NotImplementedError
+    # convert to micrometer if needed
+    if pixels.physical_size_x_unit == UnitsLength.NANOMETER:
+        physical_size = pixels.physical_size_x / 1000
+    elif pixels.physical_size_x_unit == UnitsLength.MICROMETER:
+        physical_size = pixels.physical_size_x
+    else:
+        logger.error(f"Physical unit not recognized: '{pixels.physical_size_x_unit}'.")
+        raise NotImplementedError
+    return float(physical_size)
