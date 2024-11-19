@@ -107,6 +107,8 @@ def macsima(
         **image_models_kwargs,
     )
 
+    # spatialdata only allows alphanumeric and _ in the name
+    image_name = _clean_string( image_name )
     sdata = sd.SpatialData(images={image_name: se}, table=None)
 
     return sdata
@@ -166,3 +168,8 @@ def _parse_physical_size(pixels: Pixels | None = None) -> float:
         logger.error(f"Physical unit not recognized: '{pixels.physical_size_x_unit}'.")
         raise NotImplementedError
     return float(physical_size)
+
+def _clean_string(input_string:str)->str:
+    """Replace all non-alphanumeric characters with '_'"""
+    output_string = re.sub(r'[^a-zA-Z0-9_]', '_', input_string)
+    return output_string
